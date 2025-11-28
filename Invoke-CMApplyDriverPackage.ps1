@@ -110,7 +110,7 @@
 	Author:      Nickolaj Andersen / Maurice Daly
     Contact:     @NickolajA / @MoDaly_IT
     Created:     2017-03-27
-    Updated:     2025-09-26
+    Updated:     2025-11-28
 	
 	Contributors: @CodyMathis123, @JamesMcwatty @EdenNelson
     
@@ -211,6 +211,7 @@
  	4.2.3 - (2024-02-06) - Added support for Windows 11 23H2
   	4.2.4 - (2025-01-15) - Added support for Windows 11 24H2
 	4.2.5 - (2025-01-15) - Added support for Windows 11 25H2, added Support for NUC devices from Intel/ASUS w/ ByteSpeed manufacturer. Added basica matching for manufacturer not explicitly supported.
+    4.2.6 - (2025-11-28) - Improved logic when multiple driver packages are detected with different SystemSKU values by falling back to the most recently created package.
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
 param(
@@ -1895,12 +1896,15 @@ Process {
 						Write-CMLogEntry -Value " - Successfully completed validation with multiple detected driver packages, script execution is allowed to continue" -Severity 1
 					}
 					else {
-						# This should not be possible, but added to handle output to log file for user to reach out to the developers
-						Write-CMLogEntry -Value " - WARNING: Computer detection method is currently '$($ComputerDetectionMethod)', and multiple packages have been matched but with different SystemSKU value" -Severity 2
-						Write-CMLogEntry -Value " - WARNING: This should not be a possible scenario, please reach out to the developers of this script" -Severity 2
+						# Multiple packages matched with different SystemSKU values - fallback to latest package
+						Write-CMLogEntry -Value " - WARNING: Computer detection method is currently '$($ComputerDetectionMethod)', and multiple packages have been matched but with different SystemSKU values" -Severity 2
+						Write-CMLogEntry -Value " - WARNING: This is an unexpected scenario - falling back to using the most recently created driver package" -Severity 2
 						
-						# Throw terminating error						
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+						# Sort driver packages descending based on DateCreated property and select the most recently created one
+						$Script:DriverPackageList = $DriverPackageList | Sort-Object -Property DateCreated -Descending | Select-Object -First 1
+						
+						Write-CMLogEntry -Value " - Selected driver package '$($DriverPackageList[0].PackageID)' with name: $($DriverPackageList[0].PackageName)" -Severity 1
+						Write-CMLogEntry -Value " - Successfully completed validation with multiple detected driver packages using fallback to latest match, script execution is allowed to continue" -Severity 1
 					}
 				}
 				else {
