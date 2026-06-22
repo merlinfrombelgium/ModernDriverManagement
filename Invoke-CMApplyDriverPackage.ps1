@@ -48,7 +48,7 @@
 	Define the value that will be used as the target operating system version e.g. '2004'.
 
 .PARAMETER TargetOSArchitecture
-	Define the value that will be used as the target operating system architecture e.g. 'x64'.
+	Define the value that will be used as the target operating system architecture e.g. 'x64', 'x86' or 'Arm64'.
 
 .PARAMETER OperationalMode
 	Define the operational mode, either Production or Pilot, for when calling ConfigMgr WebService to only return objects matching the selected operational mode.
@@ -110,7 +110,7 @@
 	Author:      Nickolaj Andersen / Maurice Daly
     Contact:     @NickolajA / @MoDaly_IT
     Created:     2017-03-27
-    Updated:     2025-11-28
+    Updated:     2026-06-19
 	
 	Contributors: @CodyMathis123, @JamesMcwatty @EdenNelson
     
@@ -212,6 +212,12 @@
   	4.2.4 - (2025-01-15) - Added support for Windows 11 24H2
 	4.2.5 - (2025-01-15) - Added support for Windows 11 25H2, added Support for NUC devices from Intel/ASUS w/ ByteSpeed manufacturer. Added basica matching for manufacturer not explicitly supported.
     4.2.6 - (2025-11-28) - Improved logic when multiple driver packages are detected with different SystemSKU values by falling back to the most recently created package.
+    4.2.7 - (2026-06-19) - Added support for Arm64 (ARM64) driver packages and devices:
+						 - TargetOSArchitecture now accepts 'Arm64' in addition to 'x64' and 'x86'
+						 - Get-OSArchitecture translates the WMI 'ARM 64-bit Processor' value to 'Arm64' for DriverUpdate mode
+						 - Driver package name parsing now recognises the 'Arm64' architecture token
+						 - Fixed root cause where packages matched via computer model fallback carried a null SystemSKU, causing same-device packages to be treated as having different SystemSKU values
+						 - Switched exact comparisons (OS name, architecture, OS version, computer model) from -like to -eq to avoid wildcard misinterpretation of values containing bracket characters
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
 param(
@@ -282,13 +288,13 @@ param(
 	[ValidateSet("25H2","24H2","23H2","22H2", "21H2", "21H1", "20H2", "2004", "1909", "1903", "1809", "1803", "1709", "1703", "1607")]
 	[string]$TargetOSVersion,
 	
-	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Define the value that will be used as the target operating system architecture e.g. 'x64'.")]
+	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Define the value that will be used as the target operating system architecture e.g. 'x64', 'x86' or 'Arm64'.")]
 	[parameter(Mandatory = $false, ParameterSetName = "OSUpgrade")]
 	[parameter(Mandatory = $false, ParameterSetName = "PreCache")]
 	[parameter(Mandatory = $false, ParameterSetName = "Debug")]
 	[parameter(Mandatory = $false, ParameterSetName = "XMLPackage")]
 	[ValidateNotNullOrEmpty()]
-	[ValidateSet("x64", "x86")]
+	[ValidateSet("x64", "x86", "Arm64")]
 	[string]$TargetOSArchitecture = "x64",
 	
 	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Define the operational mode, either Production or Pilot, for when calling ConfigMgr WebService to only return objects matching the selected operational mode.")]
@@ -1066,6 +1072,9 @@ Process {
 			"0" {
 				$OSArchitecture = "x86"
 			}
+			"*ARM*" {
+				$OSArchitecture = "Arm64"
+			}
 			"64*" {
 				$OSArchitecture = "x64"
 			}
@@ -1407,7 +1416,7 @@ Process {
 			}
 			
 			# Add driver package OS architecture details to custom driver package details object
-			if ($DriverPackageItem.Name -match "^.*(?<Architecture>(x86|x64)).*") {
+			if ($DriverPackageItem.Name -match "^.*(?<Architecture>(x86|x64|Arm64)).*") {
 				$DriverPackageDetails.Architecture = $Matches.Architecture
 			}
 			
@@ -1644,7 +1653,7 @@ Process {
 			}
 		}
 		else {
-			if ($DriverPackageInput -like $OSImageData.Version) {
+			if ($DriverPackageInput -eq $OSImageData.Version) {
 				# OS version match found
 				Write-CMLogEntry -Value " - Matched operating system version: $($OSImageData.Version)" -Severity 1
 				return $true
@@ -1666,7 +1675,7 @@ Process {
 			[ValidateNotNullOrEmpty()]
 			[PSCustomObject]$OSImageData
 		)
-		if ($DriverPackageInput -like $OSImageData.Architecture) {
+		if ($DriverPackageInput -eq $OSImageData.Architecture) {
 			# OS architecture match found
 			Write-CMLogEntry -Value " - Matched operating system architecture: $($OSImageData.Architecture)" -Severity 1
 			return $true
@@ -1688,7 +1697,7 @@ Process {
 			[ValidateNotNullOrEmpty()]
 			[PSCustomObject]$OSImageData
 		)
-		if ($DriverPackageInput -like $OSImageData.Name) {
+		if ($DriverPackageInput -eq $OSImageData.Name) {
 			# OS name match found
 			Write-CMLogEntry -Value " - Matched operating system name: $($OSImageData.Name)" -Severity 1
 			return $true
@@ -1711,16 +1720,22 @@ Process {
 			[PSCustomObject]$ComputerData
 		)
 		# Construct custom object for return value
+		# SystemSKUValue is included so that packages matched via the computer model fallback
+		# carry the same SystemSKU identity as packages matched directly by SystemSKU. This keeps
+		# the post-processing list consistent and prevents same-device packages from being treated
+		# as having 'different SystemSKU values' in Confirm-DriverPackageList.
 		$ModelDetectionResult = [PSCustomObject]@{
 			Detected = $null
+			SystemSKUValue = $null
 		}
 		
-		if ($DriverPackageInput -like $ComputerData.Model) {
+		if ($DriverPackageInput -eq $ComputerData.Model) {
 			# Computer model match found
 			Write-CMLogEntry -Value " - Matched computer model: $($ComputerData.Model)" -Severity 1
 			
 			# Set properties for custom object for return value
 			$ModelDetectionResult.Detected = $true
+			$ModelDetectionResult.SystemSKUValue = $ComputerData.SystemSKU
 			
 			return $ModelDetectionResult
 		}
@@ -1728,6 +1743,7 @@ Process {
 			# Computer model match was not found
 			# Set properties for custom object for return value
 			$ModelDetectionResult.Detected = $false
+			$ModelDetectionResult.SystemSKUValue = ""
 			
 			return $ModelDetectionResult
 		}
