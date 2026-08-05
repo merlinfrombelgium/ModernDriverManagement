@@ -110,7 +110,7 @@
 	Author:      Nickolaj Andersen / Maurice Daly
     Contact:     @NickolajA / @MoDaly_IT
     Created:     2017-03-27
-    Updated:     2026-06-19
+    Updated:     2026-08-05
 	
 	Contributors: @CodyMathis123, @JamesMcwatty @EdenNelson
     
@@ -218,6 +218,8 @@
 						 - Driver package name parsing now recognises the 'Arm64' architecture token
 						 - Fixed root cause where packages matched via computer model fallback carried a null SystemSKU, causing same-device packages to be treated as having different SystemSKU values
 						 - Switched exact comparisons (OS name, architecture, OS version, computer model) from -like to -eq to avoid wildcard misinterpretation of values containing bracket characters
+    4.2.8 - (2026-08-05) - Documented the Get-ComputerData default branch with a placeholder/template describing how to add support for custom/unlisted manufacturers (WMI/CIM property sources, the Manufacturer-match requirement in Confirm-DriverPackage, and the -Manufacturer debug ValidateSet).
+						 - Logging improvements for troubleshooting: Invoke-Executable launch failures are now written to the log file (Severity 3) instead of only Write-Warning, and return -1 rather than silently continuing; Get-ComputerData wraps manufacturer detection in try/catch that logs the manufacturer context on failure and degrades gracefully; the unlisted-manufacturer default branch now logs a warning; and a script version + key parameter banner is written at startup.
 #>
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "BareMetal")]
 param(
@@ -448,11 +450,15 @@ Process {
 		# Invoke executable and wait for process to exit
 		try {
 			$Invocation = Start-Process @SplatArgs
-			$Handle = $Invocation.Handle
+			# Access .Handle to cache the process handle so WaitForExit()/ExitCode work reliably
+			$null = $Invocation.Handle
 			$Invocation.WaitForExit()
 		}
 		catch [System.Exception] {
-			Write-Warning -Message $_.Exception.Message; break
+			# Log to the CMTrace log file -- Write-Warning alone is not captured in a task sequence,
+			# so a failure to even launch the executable would otherwise leave no trace in the log.
+			Write-CMLogEntry -Value " - Failed to invoke executable '$($FilePath)'. Error message: $($_.Exception.Message)" -Severity 3
+			return -1
 		}
 		
 		return $Invocation.ExitCode
@@ -1159,6 +1165,13 @@ Process {
 		
 		# Gather computer details based upon specific computer manufacturer
 		$ComputerManufacturer = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Manufacturer).Trim()
+		
+		# Wrapped in try/catch so a failure in any manufacturer-specific WMI/parse step (e.g. a null
+		# BaseBoardProduct, a short Lenovo Model for SubString, or a Dell OEMString without a bracketed
+		# SKU) is logged with the manufacturer context, instead of surfacing only as a generic error
+		# later, and so a non-critical sub-step failure does not abort detection before
+		# Test-ComputerDetails can run.
+		try {
 		switch -Wildcard ($ComputerManufacturer) {
 			"*Microsoft*" {
 				$ComputerDetails.Manufacturer = "Microsoft"
@@ -1226,8 +1239,54 @@ Process {
 				}
 			}
 			Default {
+				# =============================================================================
+				# CUSTOM / UNLISTED MANUFACTURER -- ADD SUPPORT HERE
+				# -----------------------------------------------------------------------------
+				# This default branch is reached when the detected Win32_ComputerSystem
+				# Manufacturer value does not match any of the wildcards above. It performs a
+				# best-effort generic detection (Manufacturer + Model only) so that
+				# ComputerModel-based driver package matching can still work.
+				#
+				# To add full support for a new manufacturer, copy the template below into its
+				# own "*<Manufacturer>*" branch above. The wildcard must match the value reported
+				# by:  (Get-WmiObject -Class Win32_ComputerSystem).Manufacturer
+				# Populate the properties from the correct WMI/CIM source for that OEM. The
+				# SystemSKU source differs per vendor -- for example:
+				#   Dell     -> (Get-CIMInstance -ClassName MS_SystemInformation -Namespace root\WMI).SystemSku
+				#   HP       -> (Get-CIMInstance -ClassName MS_SystemInformation -Namespace root\WMI).BaseBoardProduct
+				#   Lenovo   -> first 4 characters of Win32_ComputerSystem.Model (the machine type)
+				#   Others   -> Win32_BaseBoard SKU or Product
+				#
+				# Template (add as a new branch above and adjust the values):
+				#   "*Acme*" {
+				#       $ComputerDetails.Manufacturer = "Acme"
+				#       $ComputerDetails.Model        = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
+				#       $ComputerDetails.SystemSKU    = (Get-WmiObject -Class "Win32_BaseBoard" | Select-Object -ExpandProperty SKU).Trim()
+				#   }
+				#
+				# NOTES:
+				#  - The Manufacturer value set here must match the 'Manufacturer' property of the
+				#    corresponding driver packages, otherwise Confirm-DriverPackage filters them out
+				#    (it compares $_.Manufacturer -like $ComputerData.Manufacturer).
+				#  - Without a SystemSKU, matching falls back to the computer Model only. Adding a
+				#    SystemSKU source above enables the more reliable SystemSKU detection method.
+				#  - To exercise a new manufacturer with -DebugMode, also add it to the ValidateSet
+				#    on the -Manufacturer parameter at the top of this script.
+				# =============================================================================
 				$ComputerDetails.Manufacturer = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Manufacturer).Trim()
 				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
+				# SystemSKU intentionally left unset -- add the correct source for this OEM using the template above.
+				Write-CMLogEntry -Value " - Manufacturer '$($ComputerManufacturer)' is not explicitly supported. Using best-effort model detection only (no SystemSKU); matching will rely on the computer Model. See the CUSTOM / UNLISTED MANUFACTURER template in Get-ComputerData to add full support." -Severity 2
+			}
+		}
+		}
+		catch [System.Exception] {
+			Write-CMLogEntry -Value " - An error occurred while gathering computer details for manufacturer '$($ComputerManufacturer)'. Error message: $($_.Exception.Message)" -Severity 3
+			# Best-effort fallback so downstream computer-model matching can still proceed. A missing value
+			# here is handled by Test-ComputerDetails, which fails closed if both Model and SystemSKU are empty.
+			if ([string]::IsNullOrEmpty($ComputerDetails.Manufacturer)) { $ComputerDetails.Manufacturer = $ComputerManufacturer }
+			if ([string]::IsNullOrEmpty($ComputerDetails.Model)) {
+				try { $ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim() } catch { Write-CMLogEntry -Value " - Unable to determine computer model during fallback. Error message: $($_.Exception.Message)" -Severity 3 }
 			}
 		}
 		
@@ -2208,11 +2267,15 @@ Process {
 	}
 	
 	Write-CMLogEntry -Value "[ApplyDriverPackage]: Apply Driver Package process initiated" -Severity 1
+	Write-CMLogEntry -Value " - Script version: 4.2.8" -Severity 1
 	if ($PSCmdLet.ParameterSetName -like "Debug") {
 		Write-CMLogEntry -Value " - Apply driver package process initiated in debug mode" -Severity 1
 	}
 	Write-CMLogEntry -Value " - Apply driver package deployment type: $($PSCmdLet.ParameterSetName)" -Severity 1
 	Write-CMLogEntry -Value " - Apply driver package operational mode: $($OperationalMode)" -Severity 1
+	Write-CMLogEntry -Value " - Endpoint: '$($Endpoint)' | Filter: '$($Filter)' | DriverInstallMode: '$($DriverInstallMode)'" -Severity 1
+	Write-CMLogEntry -Value " - Target OS: '$($TargetOSName)' | Version: '$($TargetOSVersion)' | Architecture: '$($TargetOSArchitecture)'" -Severity 1
+	Write-CMLogEntry -Value " - UseDriverFallback: $($UseDriverFallback.IsPresent) | OSVersionFallback: $($OSVersionFallback.IsPresent)" -Severity 1
 	
 	# Set script error preference variable
 	$ErrorActionPreference = "Stop"
